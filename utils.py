@@ -1,7 +1,24 @@
-import jax
+import jax.numpy as jnp
 import chex
 from distrax import Categorical
 import typing as t
+
+@jit
+def softmax(x:jnp.ndarray):
+	return jnp.exp(x) / jnp.sum(jnp.exp(x))
+
+@jit
+def sum_norm(x:jnp.ndarray):
+    return x / (x.sum() + 1e-8)
+
+KL = lambda d1, d2 : d1.kl_divergence(d2)
+KL_vmap = vmap(KL, in_axes = (None, 0))
+
+@chex.dataclass
+class TrainState:
+    params : t.Collection
+    opt_state : t.Collection
+    training_steps : int = 0
 
 @chex.dataclass
 class Trajectory:

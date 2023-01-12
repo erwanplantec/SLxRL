@@ -1,4 +1,5 @@
 import jax
+import jax.numpy as jnp
 from jax import jit, vmap, value_and_grad
 import flax.linen as nn
 import typing as t
