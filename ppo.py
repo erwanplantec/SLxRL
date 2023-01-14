@@ -8,7 +8,12 @@ from distrax import Categorical
 import rlax
 import numpy as np
 import typing as t
-from utils import *
+from utils import (
+        Trajectory, 
+        TrainState,
+        ProcessedTrajectory, 
+        process_trajectory
+    )
 
 @chex.dataclass
 class Config:

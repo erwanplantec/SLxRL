@@ -8,7 +8,13 @@ from distrax import Categorical
 import rlax
 import numpy as np
 import typing as t
-import utils as ut
+from utils import (
+		Trajectory, 
+		TrainState,
+		ProcessedTrajectory, 
+		process_trajectory,
+		KL_vmap
+	)
 from ppo import ppo_loss
 
 
@@ -54,6 +60,7 @@ class SL_PPO:
         batch_maker: callable
         config: callable
         exp_collector: TYPE
+        process_trajectory (TYPE): Description
         rng (TYPE): Description
         train: TYPE
         train_state: TYPE
@@ -81,13 +88,14 @@ class SL_PPO:
         self.apply_fn, self.apply_fn_vmap, params = self._init_network(state_dims, action_dims)
         opt_state, self.opt_update = self._init_opt(params)
 
-        self.train_state = ut.TrainState(
+        self.train_state = TrainState(
             params=params,
             opt_state=opt_state
         )
 
+        self.grad_loss = self._build_grad_loss()
         self.exp_collector = self._build_rollout()
-        self.process_trajectory = vmap(ut.process_trajectory)
+        self.process_trajectory = vmap(process_trajectory)
         self.batch_maker = self._build_batch_maker()
         self.train_step = self._build_train_step()
         self.train = self._build_train()
@@ -96,6 +104,9 @@ class SL_PPO:
 
     def _build_rollout(self)->t.Callable:
         """Summary
+        
+        Returns:
+            t.Callable: Description
         """
         @partial(vmap, in_axes = (0, 0))
         def rollout(params:t.Collection, key)->Trajectory:
@@ -146,7 +157,7 @@ class SL_PPO:
             
             infos['episodes'] = episodes
 
-            return ut.Trajectory(s=traj_s, a=traj_a, lp=traj_lp, v=traj_v, r=traj_r, d=traj_d), infos
+            return Trajectory(s=traj_s, a=traj_a, lp=traj_lp, v=traj_v, r=traj_r, d=traj_d), infos
 
         return rollout
 
@@ -155,21 +166,102 @@ class SL_PPO:
     def _build_train_step(self)->t.Callable:
         """Summary
         """
-        pass
+        def train_step(train_state:TrainState, 
+        	           batches:t.Iterable)->t.Tuple[TrainState, t.Collection]:
+            """Summary
+            
+            Args:
+                train_state (TrainState): Description
+                batches (t.Iterable): Description
+            
+            Returns:
+                TYPE: Description
+            """
+            infos = {"loss" : 0.}
+            params = train_state.params
+            opt_state = train_state.opt_state
+            for mb in batches:
+                loss, grads = self.grad_loss(params, mb)
+                infos['loss'] += loss
+                updates, opt_state = self.opt_update(grads, opt_state) 
+                params = optax.apply_updates(params, updates)
+            train_state.params = params
+            train_state.opt_state = opt_state
+
+            return train_state, infos
+
+        return train_step
 
     # -------------------------------------------------------------------------
 
     def _build_train(self)->t.Callable:
         """Summary
         """
-        pass
+        def train(train_state:TrainState, steps:int):
+            """
+            ppo train function
+            
+            Args:
+                train_state (TrainState): Description
+                steps (int): Description
+            
+            Returns:
+                TYPE: Description
+            """
+            for step in range(steps):
+                keys = jax.random.split(self.rng, self.config.n_actors)
+                traj, roll_infos = self.exp_collector(train_state.params, keys)
+                traj = self.process_trajectory(traj)
+                for epoch in range(self.config.epochs):
+                    batches = make_batches(traj)
+                    train_state, infos = self.train_step(train_state, batches)
+                train_state.training_steps += 1
+                print('='*70)
+                print(f"training step n°{train_state.training_steps}")
+                print(f"n_eps : {np.mean(roll_infos['episodes'])}")
+                print(f"mean loss = {infos['loss']}")
+
+            return train_state
+
+        return train
 
     # -------------------------------------------------------------------------
 
     def _build_batch_maker(self)->t.Callable:
         """Summary
         """
-        pass
+        def make_batches(traj:ProcessedTrajectory)->t.Iterable:
+            """Summary
+            
+            Args:
+                traj (ProcessedTrajectory): Description
+            
+            Returns:
+                t.Iterable: Description
+            """
+            batches = []
+            keys = jax.random.split(self.rng, self.config.n_agents)
+            permut = vmap(jax.random.permutation)(keys, 
+            	jnp.stack([jnp.arange(self.config.T) for _ in range(self.config.n_agents)]))
+            s = jnp.stack([s[i][permut[i]] for i in range(self.config.n_agents)]) #(n_agents, T, s_dims)
+            a = jnp.stack([a[i][permut[i]] for i in range(self.config.n_agents)]) #(n_agents, T)
+            lp = jnp.stack([lp[i][permut[i]] for i in range(self.config.n_agents)])
+            ret = jnp.stack([ret[i][permut[i]] for i in range(self.config.n_agents)])
+            adv = jnp.stack([adv[i][permut[i]] for i in range(self.config.n_agents)])
+            
+            batch_size = self.config.batch_size
+            n_batch = self.config.T // batch_size
+            for i in range(n_batch):
+                batches.append((
+                    s[:, i*batch_size:(i+1)*batch_size, :],
+                    a[:, i*batch_size:(i+1)*batch_size],
+                    lp[:, i*batch_size:(i+1)*batch_size],
+                    ret[:, i*batch_size:(i+1)*batch_size],
+                    adv[:, i*batch_size:(i+1)*batch_size]
+                ))
+            return batches
+
+        return make_batches
 
     # -------------------------------------------------------------------------
 
@@ -177,7 +269,16 @@ class SL_PPO:
     	"""Summary
     	"""
     	def _ppo_loss(params, minibatch):
-    		return ppo_loss(params, apply_fn, minibatch, 
+    		"""Summary
+    		
+    		Args:
+    		    params (TYPE): Description
+    		    minibatch (TYPE): Description
+    		
+    		Returns:
+    		    TYPE: Description
+    		"""
+    		return ppo_loss(params, self.apply_fn, minibatch, 
     			self.config.c1, self.config.c2, self.config.epsilon)
 
     	@partial(vmap, in_axes=(0, None, 0, 0, 0, 0, 0, None, None, 0))
@@ -192,15 +293,15 @@ class SL_PPO:
 		        other_params (t.Collection): Description
 		        N (jnp.array): Description
 		        batch (t.Tuple): Description
-		        alpha (TYPE): Description
-		        B_succ (TYPE): Description
-		        B_nov (TYPE): Description
-		        BC_dists (TYPE): Description
-		        R (TYPE): Description
-		        I (TYPE): Description
+		        alpha (float): Description
+		        B_succ (float): Description
+		        B_nov (float): Description
+		        BC_dists (jnp.ndarray): Description
+		        R (jnp.ndarray): Description
+		        I (jnp.ndarray): Description
 		    
 		    Returns:
-		        TYPE: Description
+		        float: Description
 		    """
 		    s, a, olp, v, ret, adv = batch
 
@@ -213,7 +314,7 @@ class SL_PPO:
 		    logits_others, _ = vmap(self.apply_fn, in_axes=(0, None))(other_params, s) # To check
 		    dist_others = Categorical(logits_others)
 
-		    kls = ut.KL_vmap(dist, dist_others)  # (n_agents,)
+		    kls = KL_vmap(dist, dist_others)  # (n_agents,)
 
 		    # Compute phi
 		    # ..success bias
@@ -246,8 +347,6 @@ class SL_PPO:
         net = ActorCritic(state_dims, action_dims, **self.config.network_config)
         
         apply_fn = net.apply
-        apply_fn_mm = vmap(apply_fn)
-        appply_fn_mn = vmap(apply_fn, in_axes=(0, None))
         
         init = vmap(net.init, in_axes = (0, None))
         keys = jax.random.split(self.rng, self.config.n_agents)
@@ -261,10 +360,13 @@ class SL_PPO:
 
     # -------------------------------------------------------------------------
 
-    def _init_env(self)->t.Tuple[t.Callable, t.Callable]:
+    def _init_env(self)->t.Tuple[t.Callable, t.Callable, int, int]:
         """Summary
         """
-        pass
+        env, _ = gymnax.make(self.config.env_name)
+        action_dims = env.num_actions
+        state_dims = env.observation_space(env_params).shape[0]
+        return env.reset, env.step, state_dims, action_dims
 
     # -------------------------------------------------------------------------
 
@@ -274,4 +376,8 @@ class SL_PPO:
         Args:
             params (t.Collection): Description
         """
-        pass
+        opt = optax.adam(config.learning_rate)
+        opt_state = vmap(opt.init)(params)
+        opt_update = vmap(opt.update)
+
+        return opt_state, opt_update
