@@ -30,7 +30,7 @@ class Config:
     # Env params
     env_name:str
     # network params
-    network_config : t.Collection = {}
+    network_config : t.Collection
     learning_rate : float
     seed:int
     # Loss function params

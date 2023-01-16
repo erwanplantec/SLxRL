@@ -1,6 +1,10 @@
 import jax.numpy as jnp
+from jax import vmap, jit
+import jax
+import numpy as np
 import chex
 from distrax import Categorical
+from functools import partial
 import typing as t
 
 @jit
@@ -12,7 +16,11 @@ def sum_norm(x:jnp.ndarray):
     return x / (x.sum() + 1e-8)
 
 KL = lambda d1, d2 : d1.kl_divergence(d2)
-KL_vmap = vmap(KL, in_axes = (None, 0))
+
+def KL_vmap(logits1, logits2):
+    return Categorical(logits1).kl_divergence(
+            Categorical(logits2)
+        )
 
 @chex.dataclass
 class TrainState:
@@ -83,3 +91,14 @@ def gae_advantages(
 		advantages.append(gae)
 	advantages = advantages[::-1]
 	return jnp.array(advantages)
+
+if __name__ == '__main__':
+    logits1 = jnp.array(np.random.rand(10, 4))
+    logits2 = jnp.array(np.random.rand(2, 10, 4))
+
+    d1 = Categorical(logits1)
+    d2 = Categorical(logits2)
+
+    kls = vmap(KL_vmap2, in_axes=(None, 0))(logits1, logits2)
+
+    print(kls.shape)
