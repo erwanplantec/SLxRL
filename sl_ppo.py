@@ -98,14 +98,14 @@ class SL_PPO:
         )
 
         self.grad_loss = self._build_grad_loss()
-        self.exp_collector = self._build_rollout(state_dims)
+        self.exp_collector = jit(self._build_rollout(state_dims))
         self.process_trajectory = vmap(
             lambda traj: process_trajectory(traj,
                                             config.gamma,
                                             config.lambd)
         )
         self.batch_maker = self._build_batch_maker()
-        self.train_step = self._build_train_step()
+        self.train_step = jit(self._build_train_step())
         self.train = self._build_train()
 
     # -------------------------------------------------------------------------
@@ -143,7 +143,7 @@ class SL_PPO:
             episodes = 0
             ep_ret = 0
 
-            for step in range(config.T+1):
+            for step in range(self.config.T+1):
 
                 logits, v = self.apply_fn(params, s)
                 v = v[0]
@@ -189,10 +189,10 @@ class SL_PPO:
             params = train_state.params
             opt_state = train_state.opt_state
             for mb in batches:
-                loss, grads = self.grad_loss(params, params, config.N, mb, 
-                    config.alpha, config.B_succ, config.B_nov, 
-                    jnp.zeros((config.n_agents, config.n_agents)), 
-                    jnp.zeros((config.n_agents)), jnp.identity(config.n_agents))
+                loss, grads = self.grad_loss(params, params, self.config.N, mb, 
+                    self.config.alpha, self.config.B_succ, self.config.B_nov, 
+                    jnp.zeros((self.config.n_agents, self.config.n_agents)), 
+                    jnp.zeros((self.config.n_agents)), jnp.identity(self.config.n_agents))
                 infos['loss'] += loss
                 updates, opt_state = self.opt_update(grads, opt_state)
                 params = optax.apply_updates(params, updates)
@@ -395,7 +395,7 @@ class SL_PPO:
         Args:
             params (t.Collection): Description
         """
-        opt = optax.adam(config.learning_rate)
+        opt = optax.adam(self.config.learning_rate)
         opt_state = vmap(opt.init)(params)
         opt_update = vmap(opt.update)
 
