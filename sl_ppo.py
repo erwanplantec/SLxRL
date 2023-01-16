@@ -220,11 +220,10 @@ class SL_PPO:
                 TYPE: Description
             """
             for step in range(steps):
-                keys = jax.random.split(self.rng, self.config.n_actors)
-                traj, roll_infos = self.exp_collector(train_state.params, keys)
+                traj, roll_infos = self.exp_collector(train_state.params)
                 traj = self.process_trajectory(traj)
                 for epoch in range(self.config.epochs):
-                    batches = make_batches(traj)
+                    batches = self.batch_maker(traj)
                     train_state, infos = self.train_step(train_state, batches)
                 train_state.training_steps += 1
                 print('='*70)
@@ -404,7 +403,7 @@ class SL_PPO:
 
 if __name__ == '__main__':
 
-    config = Config(
+    _config = Config(
         training_steps=200,
         T=16,
         epochs=10,
@@ -429,18 +428,10 @@ if __name__ == '__main__':
         batch_size=4
     )
 
-    sl_ppo = SL_PPO(config)
+    sl_ppo = SL_PPO(_config)
     train_state = sl_ppo.train_state
-    params = train_state.params
-    traj, _ = sl_ppo.exp_collector(params)
-    print(traj.s.shape)
-    p_traj = sl_ppo.process_trajectory(traj)
-    print(p_traj.ret.shape)
-    batches = sl_ppo.batch_maker(p_traj)
-    print(len(batches))
-    mb = batches[0]
-    print(mb[1].shape)
-    train_state, _ = sl_ppo.train_step(train_state, batches)
+    sl_ppo.train(train_state, 5)
+
 
 
 
