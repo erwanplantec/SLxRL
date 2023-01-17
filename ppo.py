@@ -104,27 +104,26 @@ class PPO:
 
         self.rng = jax.random.PRNGKey(config.seed)
         self.env_reset, self.env_step, state_dims, action_dims = self._init_env()
-        self.apply_fn, params = self._init_network(state_dims, n_actions, 
-            state_dims, action_dims)
+        self.apply_fn, params = self._init_network(state_dims, action_dims)
         opt_state, self.opt_update = self._init_opt(params)
 
         self.grad_loss = self._build_grad_loss()
 
-        self.exp_collector = self._build_rollout(config)
-        self.make_batches = self._build_batch_maker(config)
+        self.exp_collector = self._build_rollout(state_dims)
+        self.batch_maker = self._build_batch_maker()
         self.train_step = self._build_train_step()
         self.process_trajectory = vmap(lambda traj : process_trajectory(traj, 
                                                                 config.gamma, 
                                                                 config.lambd), 
                                        in_axes = 1,
                                        out_axes = 1)
-        self.train_fn = self.build_train(config)
+        self.train_fn = self._build_train()
 
         self.train_state = TrainState(params=params, opt_state=opt_state)
     
     #-------------------------------------------------------------------------
     
-    def _build_rollout(self)->t.Callable:
+    def _build_rollout(self, state_dims: int)->t.Callable:
         """Summary
         
         Returns:
@@ -202,7 +201,7 @@ class PPO:
             """
             batches = []
             
-            permut = jax.random.permutation(rng, self.config.T * self.config.n_actors)
+            permut = jax.random.permutation(self.rng, self.config.T * self.config.n_actors)
             shape = (self.config.T * self.config.n_actors,)
             s = traj.s.reshape(shape+(-1,))[permut]
             a = traj.a.reshape(shape)[permut]
@@ -281,7 +280,7 @@ class PPO:
                 traj, roll_infos = self.exp_collector(train_state.params, keys)
                 traj = self.process_trajectory(traj)
                 for epoch in range(self.config.epochs):
-                    batches = make_batches(traj)
+                    batches = self.batch_maker(traj)
                     train_state, infos = self.train_step(train_state, batches)
                 train_state.training_steps += 1
                 print('='*70)
@@ -328,7 +327,7 @@ class PPO:
             t.Tuple[t.Callable, t.Collection]: Description
         """
         net = ActorCritic(state_dims, action_dims, **self.config.network_config)
-        params = net.init(rng, jnp.zeros((state_dims,)))
+        params = net.init(self.rng, jnp.zeros((state_dims,)))
         apply_fn = jit(net.apply)
 
         return apply_fn, params
@@ -347,7 +346,7 @@ class PPO:
         env_step = jit(env.step)
         env_reset = jit(env.reset)
 
-        return env_reset, env_step, state_dims, action_dims
+        return env_reset, jit(env_step), state_dims, action_dims
     
     #-------------------------------------------------------------------------
     
@@ -365,156 +364,3 @@ class PPO:
         opt_update = opt.update
 
         return opt_state, opt_update
-
-
-# def init_ppo(config:Config)->t.Tuple[TrainState, t.Callable]:
-
-#     """
-#     Initialize the ppo training procedures
-
-#     In :
-#         config [Config] - collection specifying the training configuration
-#     Out :
-#         train_state [TrainState] : initial train state
-#         train [Callable] : train function
-#     """
-    
-#     rng = jax.random.PRNGKey(config.seed)
-#     # Init env
-#     env_name = config.env_name
-#     env, env_params = gymnax.make(env_name)
-#     action_dims = env.num_actions
-#     state_dims = env.observation_space(env_params).shape[0]
-#     env_step = jit(env.step)
-#     env_reset = jit(env.reset)
-#     # Init network
-#     net = ActorCritic(state_dims, action_dims, **config.network_config)
-#     params = net.init(rng, jnp.zeros((state_dims,)))
-#     apply_fn = jit(net.apply)
-#     # Init optimizer
-#     opt = optax.adam(config.learning_rate)
-#     opt_state = opt.init(params)
-#     opt_update = opt.update
-
-#     train_state = TrainState(
-#         params    = params, 
-#         opt_state = opt_state, 
-#         )
-#     #---------------------------------------------------------------------------
-#     _process_trajectory = vmap(lambda traj : process_trajectory(traj, 
-#                                                                 config.gamma, 
-#                                                                 config.lambd), 
-#                                in_axes = 1,
-#                                out_axes = 1)
-        
-#     def make_batches(traj:ProcessedTrajectory)->t.Iterable:
-#         batches = []
-        
-#         permut = jax.random.permutation(rng, config.T * config.n_actors)
-#         shape = (config.T * config.n_actors,)
-#         s = traj.s.reshape(shape+(-1,))[permut]
-#         a = traj.a.reshape(shape)[permut]
-#         lp = traj.lp.reshape(shape)[permut]
-#         ret = traj.ret.reshape(shape)[permut]
-#         adv = traj.adv.reshape(shape)[permut]
-        
-#         batch_size = config.batch_size * config.n_actors
-#         n_batch = (config.T * config.n_actors) // batch_size
-#         for i in range(n_batch):
-#             batches.append((
-#                 s[i*batch_size:(i+1)*batch_size],
-#                 a[i*batch_size:(i+1)*batch_size],
-#                 lp[i*batch_size:(i+1)*batch_size],
-#                 ret[i*batch_size:(i+1)*batch_size],
-#                 adv[i*batch_size:(i+1)*batch_size]
-#             ))
-#         return batches
-#     #---------------------------------------------------------------------------
-#     @partial(vmap, in_axes = (None, 0), out_axes = (1, 0))
-#     def rollout(params:t.Collection, key)->Trajectory:
-
-#         infos = {'episodes':0}
-        
-#         ts = jnp.zeros((config.T+1, state_dims))
-#         ta = jnp.zeros((config.T+1,))
-#         tlp = jnp.zeros((config.T+1,))
-#         tv = jnp.zeros((config.T+1,))
-#         tr = jnp.zeros((config.T+1,))
-#         td = jnp.zeros((config.T+1,))
-
-#         sample_key, reset_key, step_key = jax.random.split(rng, 3)
-        
-#         s, env_state = env_reset(reset_key)
-
-#         episodes = 0
-#         ep_ret = 0
-        
-#         for step in range(config.T+1):
-            
-#             logits, v = apply_fn(params, s)
-#             v = v[0]
-#             dist = Categorical(logits)
-#             a, lp = dist.sample_and_log_prob(seed=sample_key)
-#             s_, env_state, r, d, _ = env_step(step_key, env_state, a)
-#             ep_ret += r
-
-#             episodes += d.astype(int)
-
-#             ts = ts.at[step].set(s)
-#             ta = ta.at[step].set(a)
-#             tlp = tlp.at[step].set(lp)
-#             tv = tv.at[step].set(v)
-#             tr = tr.at[step].set(r)
-#             td = td.at[step].set(d.astype(float))
-
-#             s = s_
-        
-#         infos['episodes'] = episodes
-
-#         return Trajectory(s=ts, a=ta, lp=tlp, v=tv, r=tr, d=td), infos
-#     #---------------------------------------------------------------------------
-    
-#     def loss_fn(params, minibatch):
-#         return config.loss_fn(params, apply_fn, minibatch, config.c1, 
-#                               config.c2, config.epsilon)
-    
-#     grad_loss = jit(value_and_grad(loss_fn))
-
-#     #---------------------------------------------------------------------------
-#     def train_step(train_state:TrainState, batches:t.Iterable):
-            
-#         infos = {"loss" : 0.}
-#         params = train_state.params
-#         opt_state = train_state.opt_state
-#         for mb in batches:
-#             loss, grads = grad_loss(params, mb)
-#             infos['loss'] += loss
-#             updates, opt_state = opt_update(grads, opt_state) 
-#             params = optax.apply_updates(params, updates)
-#         train_state.params = params
-#         train_state.opt_state = opt_state
-
-#         return train_state, infos
-
-#     #---------------------------------------------------------------------------
-
-#     def train(train_state:TrainState, steps:int):
-#         """
-#         ppo train function
-#         """
-#         for step in range(steps):
-#             keys = jax.random.split(rng, config.n_actors)
-#             traj, roll_infos = rollout(train_state.params, keys)
-#             traj = _process_trajectory(traj)
-#             for epoch in range(config.epochs):
-#                 batches = make_batches(traj)
-#                 train_state, infos = train_step(train_state, batches)
-#             train_state.training_steps += 1
-#             print('='*70)
-#             print(f"training step n°{train_state.training_steps}")
-#             print(f"n_eps : {np.mean(roll_infos['episodes'])}")
-#             print(f"mean loss = {infos['loss']}")
-
-#         return train_state
-
-#     return train_state, train
