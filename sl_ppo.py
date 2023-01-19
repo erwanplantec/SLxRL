@@ -16,10 +16,43 @@ from utils import (
     TrainState,
     ProcessedTrajectory,
     process_trajectory,
-    KL_vmap
+    KL_vmap,
+    stack_trees
 )
 from models import ActorCritic
 from ppo import ppo_loss
+
+
+@chex.dataclass
+class SL_PPO_Config:
+
+    """Summary
+    """
+
+    T: int
+    epochs: int
+    # agents
+    BC_fn: t.Callable
+    n_agents: int  # number of agents
+    N: jnp.ndarray  # Neighboring relations : N[i, j] = 1. -> i and j neighbors
+    B_succ: jnp.ndarray  # success biases shape = (n_agents,)
+    B_nov: jnp.ndarray  # novelty bias shape = (n_agents,)
+    alpha: jnp.ndarray  # social learning rate = (n_agents,)
+
+    # Env params
+    env_name: str
+    # network params
+    network_config: t.Collection
+    learning_rate: float
+    seed: int
+    # Loss function params
+    c1: float
+    c2: float
+    gamma: float
+    lambd: float
+    epsilon: float
+
+    batch_size: int
 
 
 @chex.dataclass
@@ -67,12 +100,6 @@ class SL_PPO:
         train: TYPE
         train_state: TYPE
         train_step: TYPE
-        Description
-        Description
-        Description
-        Description
-        Description
-        Description
     """
 
     # -------------------------------------------------------------------------
@@ -97,11 +124,12 @@ class SL_PPO:
         )
 
         self.grad_loss = self._build_grad_loss()
-        self.exp_collector = self._build_rollout(state_dims)
+        self.exp_collector = jit(self._build_rollout(state_dims))
         self.process_trajectory = vmap(
             lambda traj: process_trajectory(traj,
                                             config.gamma,
-                                            config.lambd)
+                                            config.lambd),
+            in_axes=1, out_axes=1
         )
         self.batch_maker = self._build_batch_maker()
         self.train_step = jit(self._build_train_step())
@@ -116,6 +144,22 @@ class SL_PPO:
             t.Callable: Description
         """
         @vmap
+        def a_and_lp(logits, key):
+            dist = Categorical(logits)
+            return dist.sample_and_log_prob(seed = key)
+
+        def scannable_step(carry, key):
+            s, e_s, params = carry
+            key, sample_key, step_key = jax.random.split(key, 3)
+            logits, v = self.apply_fn_vmap(params, s)
+            v = v[:, 0]
+            dist = Categorical(logits)
+            a, lp = a_and_lp(logits, jax.random.split(sample_key, self.config.n_agents))
+            s_, e_s, r, d, _ = vmap(self.env_step)(jax.random.split(step_key, self.config.n_agents), e_s, a)
+            return (s_, e_s, params), Trajectory(s=s, a=a, lp=lp, v=v, r=r, d=d)
+            
+            
+
         def rollout(params: t.Collection, key)->Trajectory:
             """Summary
 
@@ -126,47 +170,25 @@ class SL_PPO:
             Returns:
                 Trajectory: Description
             """
+
             infos = {'episodes': 0}
 
-            traj_s = jnp.zeros((self.config.T+1, state_dims))
-            traj_a = jnp.zeros((self.config.T+1,))
-            traj_lp = jnp.zeros((self.config.T+1,))
-            traj_v = jnp.zeros((self.config.T+1,))
-            traj_r = jnp.zeros((self.config.T+1,))
-            traj_d = jnp.zeros((self.config.T+1,))
+            # sample_keys, reset_keys, step_keys = jax.random.split(keys, 3)
 
-            sample_key, reset_key, step_key = jax.random.split(key, 3)
+            key, reset_key = jax.random.split(key)
 
-            s, env_state = self.env_reset(reset_key)
+            s, env_state = vmap(self.env_reset)(jax.random.split(reset_key, self.config.n_agents))
 
-            episodes = 0
-            ep_ret = 0
+            episodes = jnp.zeros((self.config.n_agents, ))
 
-            for step in range(self.config.T+1):
+            step_keys = jax.random.split(key, self.config.T+1)
 
-                logits, v = self.apply_fn(params, s)
-                v = v[0]
-                dist = Categorical(logits)
-                sample_key, subkey = jax.random.split(sample_key)
-                a, lp = dist.sample_and_log_prob(seed=subkey)
-                step_key, subkey = jax.random.split(step_key)
-                s_, env_state, r, d, _ = self.env_step(subkey, env_state, a)
-                ep_ret += r
-
-                episodes += d.astype(int)
-
-                traj_s = traj_s.at[step].set(s)
-                traj_a = traj_a.at[step].set(a)
-                traj_lp = traj_lp.at[step].set(lp)
-                traj_v = traj_v.at[step].set(v)
-                traj_r = traj_r.at[step].set(r)
-                traj_d = traj_d.at[step].set(d.astype(float))
-
-                s = s_
-
-            infos['episodes'] = episodes
-
-            return Trajectory(s=traj_s, a=traj_a, lp=traj_lp, v=traj_v, r=traj_r, d=traj_d), infos
+            final, traj = jax.lax.scan(scannable_step, (s, env_state, params),
+                                       step_keys)
+            episodes = jnp.sum(traj.d.astype(float), axis = 0)
+            avg_return = jnp.sum(traj.r, axis = 0) / (episodes+1)
+            
+            return traj, {"episodes":episodes, "avg_ret":avg_return}
 
         return rollout
 
@@ -176,7 +198,7 @@ class SL_PPO:
         """Summary
         """
         def train_step(train_state: TrainState,
-                       batches: t.Iterable)->t.Tuple[TrainState, t.Collection]:
+                       batches : t.Collection)->t.Tuple[TrainState, t.Collection]:
             """Summary
 
             Args:
@@ -186,21 +208,22 @@ class SL_PPO:
             Returns:
                 TYPE: Description
             """
-            infos = {"loss": 0.}
+            loss_infos = {"loss": 0.}
+            #batches = self.batch_maker(traj, key)
             params = train_state.params
             opt_state = train_state.opt_state
             for mb in batches:
-                loss, grads = self.grad_loss(params, params, self.config.N, mb, 
-                    self.config.alpha, self.config.B_succ, self.config.B_nov, 
-                    jnp.zeros((self.config.n_agents, self.config.n_agents)), 
-                    jnp.zeros((self.config.n_agents)), jnp.identity(self.config.n_agents))
-                infos['loss'] += loss
+                loss, grads = self.grad_loss(params, mb, 
+                                            jnp.zeros((self.config.n_agents, 
+                                                       self.config.n_agents)),
+                                            jnp.zeros((self.config.n_agents,)))
+                loss_infos['loss'] += loss
                 updates, opt_state = self.opt_update(grads, opt_state)
                 params = optax.apply_updates(params, updates)
             train_state.params = params
             train_state.opt_state = opt_state
 
-            return train_state, infos
+            return train_state, loss_infos
 
         return train_step
 
@@ -209,6 +232,25 @@ class SL_PPO:
     def _build_train(self)->t.Callable:
         """Summary
         """
+        @jit
+        def inner_step(train_state, key):
+            
+            step_key, roll_key, batch_key = jax.random.split(key, 3) 
+            
+            traj, roll_infos = self.exp_collector(train_state.params, roll_key)
+            traj = self.process_trajectory(traj)
+            batches = [self.batch_maker(traj, key) for key in jax.random.split(batch_key, self.config.epochs)]
+            batches = jax.tree_map(lambda *trees : jnp.stack(trees), 
+                                   *batches)
+            train_state, infos = jax.lax.scan(
+                lambda train_state, batches : self.train_step(train_state, batches),
+                train_state, batches
+            )
+
+            train_state.training_steps+=1
+            
+            return train_state, {**roll_infos, **infos}
+
         def train(train_state: TrainState, steps: int, verb: bool = True):
             """
             ppo train function
@@ -220,24 +262,14 @@ class SL_PPO:
             Returns:
                 TYPE: Description
             """
-            key = self.rng
-            for step in range(steps):
-                key, roll_key, batch_key = jax.random.split(key, 3) 
-                roll_key = jax.random.split(roll_key, self.config.n_agents)
-                traj, roll_infos = self.exp_collector(train_state.params, roll_key)
-                traj = self.process_trajectory(traj)
-                for epoch in range(self.config.epochs):
-                    batch_key, subkey = jax.random.split(batch_key)
-                    batches = self.batch_maker(traj, subkey)
-                    train_state, infos = self.train_step(train_state, batches)
-                train_state.training_steps += 1
-                if verb :
-                    print('='*70)
-                    print(f"training step n°{train_state.training_steps}")
-                    print(f"n_eps : {roll_infos['episodes']}")
-                    print(f"mean loss = {infos['loss']}")
+            keys = jax.random.split(self.rng, 20)
+            logs = []
+            for step in tqdm(range(steps)):
+                train_state, log = inner_step(train_state, keys[step])
+                logs.append(log)
+            logs = jax.tree_map(lambda *trees : jnp.stack(list(trees)), *logs)
 
-            return train_state
+            return train_state, logs
 
         return train
 
@@ -261,22 +293,22 @@ class SL_PPO:
                 keys, self.config.T
             )
             s, a, lp, ret, adv = traj.s, traj.a, traj.lp, traj.ret, traj.adv
-            # (n_agents, T, s_dims)
-            s = jnp.stack([s[i, permut[i]] for i in range(self.config.n_agents)])
-            a = jnp.stack([a[i, permut[i]] for i in range(self.config.n_agents)])  # (n_agents, T)
-            lp = jnp.stack([lp[i, permut[i]] for i in range(self.config.n_agents)])
-            ret = jnp.stack([ret[i, permut[i]] for i in range(self.config.n_agents)])
-            adv = jnp.stack([adv[i, permut[i]] for i in range(self.config.n_agents)])
+            # (T, n_agents, s_dims)
+            s = jnp.stack([s[permut[i], i] for i in range(self.config.n_agents)], axis=1)
+            a = jnp.stack([a[permut[i], i] for i in range(self.config.n_agents)], axis=1)  # (n_agents, T)
+            lp = jnp.stack([lp[permut[i], i] for i in range(self.config.n_agents)], axis=1)
+            ret = jnp.stack([ret[permut[i], i] for i in range(self.config.n_agents)], axis=1)
+            adv = jnp.stack([adv[permut[i], i] for i in range(self.config.n_agents)], axis=1)
 
             batch_size = self.config.batch_size
             n_batch = self.config.T // batch_size
             for i in range(n_batch):
                 batches.append((
-                    s[:, i*batch_size:(i+1)*batch_size, :],
-                    a[:, i*batch_size:(i+1)*batch_size],
-                    lp[:, i*batch_size:(i+1)*batch_size],
-                    ret[:, i*batch_size:(i+1)*batch_size],
-                    adv[:, i*batch_size:(i+1)*batch_size]
+                    s[i*batch_size:(i+1)*batch_size, :, :],
+                    a[i*batch_size:(i+1)*batch_size, :],
+                    lp[i*batch_size:(i+1)*batch_size, :],
+                    ret[i*batch_size:(i+1)*batch_size, :],
+                    adv[i*batch_size:(i+1)*batch_size, :]
                 ))
             return batches
 
@@ -300,7 +332,7 @@ class SL_PPO:
             return ppo_loss(params, self.apply_fn, minibatch,
                             self.config.c1, self.config.c2, self.config.epsilon)
 
-        @partial(vmap, in_axes=(0, None, 0, 0, 0, 0, 0, None, None, 0))
+        @partial(vmap, in_axes=(0, None, 0, 1, 0, 0, 0, None, None, 0))
         @value_and_grad
         def slppo_loss(params: t.Collection, other_params: t.Collection,
                        N: jnp.array, batch: t.Tuple, alpha: float,
@@ -349,7 +381,14 @@ class SL_PPO:
 
             return loss_ppo + alpha * sl_loss
 
-        return slppo_loss
+        def loss_fn(params: t.Collection, batch, BC_dists: jnp.ndarray, R: jnp.ndarray):
+            return slppo_loss(
+                params, params, self.config.N, batch, self.config.alpha, 
+                self.config.B_succ, self.config.B_nov, BC_dists, R, 
+                jnp.identity(self.config.n_agents)
+            )
+
+        return jit(loss_fn)
 
     # -------------------------------------------------------------------------
 
@@ -400,7 +439,8 @@ class SL_PPO:
         opt_state = vmap(opt.init)(params)
         opt_update = vmap(opt.update)
 
-        return opt_state, opt_update
+        return opt_state, jit(opt_update)
+
 
 if __name__ == '__main__':
 

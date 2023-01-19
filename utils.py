@@ -45,6 +45,10 @@ class ProcessedTrajectory:
     ret : jnp.ndarray
     adv : jnp.ndarray
 
+def stack_trees(trees: t.Iterable[t.Collection])->t.Collection:
+    return jax.tree_map(
+        lambda *trees : jnp.stack(trees) , *trees)
+
 def pick_action(params, apply_fn, s):
 	"""
 	Out : action index, log_prob, value
